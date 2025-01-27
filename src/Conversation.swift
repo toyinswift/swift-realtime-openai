@@ -8,190 +8,161 @@ public enum ConversationError: Error {
 
 @Observable
 public final class Conversation: Sendable {
-    private let client: RealtimeAPI
-    @MainActor private var cancelTask: (() -> Void)?
-    private let errorStream: AsyncStream<ServerError>.Continuation
+    private let clientOne: RealtimeAPI
+    private let clientTwo: RealtimeAPI
+    @MainActor private var cancelTaskOne: (() -> Void)?
+    @MainActor private var cancelTaskTwo: (() -> Void)?
+    private let errorStreamOne: AsyncStream<ServerError>.Continuation
+    private let errorStreamTwo: AsyncStream<ServerError>.Continuation
 
-    private let audioEngine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let queuedSamples = UnsafeMutableArray<String>()
-    private let apiConverter = UnsafeInteriorMutable<AVAudioConverter>()
-    private let userConverter = UnsafeInteriorMutable<AVAudioConverter>()
+    private let audioEngineOne = AVAudioEngine()
+    private let audioEngineTwo = AVAudioEngine()
     private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
 
-    public let errors: AsyncStream<ServerError>
+    /// Errors streams for both instances
+    public let errorsOne: AsyncStream<ServerError>
+    public let errorsTwo: AsyncStream<ServerError>
 
-    @MainActor public private(set) var id: String?
-    @MainActor public private(set) var session: Session?
-    @MainActor public private(set) var entries: [Item] = []
-    @MainActor public private(set) var connected: Bool = false
-    @MainActor public private(set) var isListening: Bool = false
-    @MainActor public private(set) var handlingVoice: Bool = false
-    @MainActor public private(set) var isUserSpeaking: Bool = false
-    @MainActor public private(set) var isPlaying: Bool = false
+    /// Instance state
+    @MainActor public private(set) var isListeningOne: Bool = false
+    @MainActor public private(set) var isListeningTwo: Bool = false
+    @MainActor public private(set) var handlingVoiceOne: Bool = false
+    @MainActor public private(set) var handlingVoiceTwo: Bool = false
 
-    @MainActor public var messages: [Item.Message] {
-        entries.compactMap {
-            if case let .message(message) = $0 {
-                return message
-            }
-            return nil
-        }
-    }
+    /// Initializes the `Conversation` class with two API tokens.
+    public init(authTokenOne: String, authTokenTwo: String) {
+        let modelName = "gpt-4o-mini-realtime-preview-2024-12-17"
+        self.clientOne = RealtimeAPI.webSocket(authToken: authTokenOne, model: modelName)
+        self.clientTwo = RealtimeAPI.webSocket(authToken: authTokenTwo, model: modelName)
+        (errorsOne, errorStreamOne) = AsyncStream.makeStream(of: ServerError.self)
+        (errorsTwo, errorStreamTwo) = AsyncStream.makeStream(of: ServerError.self)
 
-    private init(client: RealtimeAPI) {
-        self.client = client
-        (errors, errorStream) = AsyncStream.makeStream(of: ServerError.self)
-
-        let task = Task.detached { [weak self] in
-            guard let self else { return }
-            for try await event in client.events {
-                await self.handleEvent(event)
-            }
-            await MainActor.run { self.connected = false }
-        }
-
-        Task { @MainActor in
-            self.cancelTask = task.cancel
-            client.onDisconnect = { [weak self] in
-                guard let self else { return }
-                Task { @MainActor in self.connected = false }
-            }
-            self._keepIsPlayingPropertyUpdated()
-        }
+        setupClient(client: clientOne, errorStream: errorStreamOne, taskCancel: &cancelTaskOne)
+        setupClient(client: clientTwo, errorStream: errorStreamTwo, taskCancel: &cancelTaskTwo)
     }
 
     deinit {
-        errorStream.finish()
+        errorStreamOne.finish()
+        errorStreamTwo.finish()
         DispatchQueue.main.asyncAndWait {
-            cancelTask?()
-            stopHandlingVoice()
+            cancelTaskOne?()
+            cancelTaskTwo?()
+            stopHandlingVoiceOne()
+            stopHandlingVoiceTwo()
         }
     }
 
-    public convenience init(authToken token: String, model: String = "gpt-4o-realtime-preview") {
-        self.init(client: RealtimeAPI.webSocket(authToken: token, model: model))
-    }
-
-    public convenience init(connectingTo request: URLRequest) {
-        self.init(client: RealtimeAPI.webSocket(connectingTo: request))
-    }
-
-    @MainActor public func waitForConnection() async {
-        while !connected {
-            try? await Task.sleep(for: .milliseconds(500))
+    /// Setup a realtime client for event handling
+    private func setupClient(client: RealtimeAPI, errorStream: AsyncStream<ServerError>.Continuation, taskCancel: inout (() -> Void)?) {
+        let task = Task.detached { [weak self] in
+            guard let self else { return }
+            for try await event in client.events {
+                // Handle events for the specific client here (if needed)
+            }
         }
+        taskCancel = task.cancel
     }
 
-    @MainActor public func whenConnected<E>(_ callback: @Sendable () async throws(E) -> Void) async throws(E) {
-        await waitForConnection()
-        try await callback()
-    }
+    // MARK: - Listening and Handling Voice Input
 
-    public func updateSession(withChanges callback: (inout Session) -> Void) async throws {
-        guard var session = await session else {
-            throw ConversationError.sessionNotFound
+    /// Start listening for the first instance
+    @MainActor public func startListeningOne() throws {
+        guard !isListeningOne else { return }
+        if !handlingVoiceOne { try startHandlingVoiceOne() }
+
+        audioEngineOne.inputNode.installTap(onBus: 0, bufferSize: 4096, format: audioEngineOne.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.processAudioBufferOne(buffer: buffer)
         }
-        callback(&session)
-        try await setSession(session)
+        isListeningOne = true
     }
 
-    public func setSession(_ session: Session) async throws {
-        var session = session
-        session.id = nil
-        try await client.send(event: .updateSession(session))
-    }
+    /// Start listening for the second instance
+    @MainActor public func startListeningOther() throws {
+        guard !isListeningTwo else { return }
+        if !handlingVoiceTwo { try startHandlingVoiceTwo() }
 
-    public func send(event: ClientEvent) async throws {
-        try await client.send(event: event)
-    }
-
-    public func send(audioDelta audio: Data, commit: Bool = false) async throws {
-        try await send(event: .appendInputAudioBuffer(encoding: audio))
-        if commit { try await send(event: .commitInputAudioBuffer()) }
-    }
-
-    public func send(from role: Item.ItemRole, text: String, response: Response.Config? = nil) async throws {
-        if await handlingVoice { await interruptSpeech() }
-        try await send(event: .createConversationItem(Item(message: Item.Message(id: String(randomLength: 32), from: role, content: [.input_text(text)]))))
-        try await send(event: .createResponse(response))
-    }
-
-    public func send(result output: Item.FunctionCallOutput) async throws {
-        try await send(event: .createConversationItem(Item(with: output)))
-    }
-}
-
-public extension Conversation {
-    @MainActor func startListening() throws {
-        guard !isListening else { return }
-        if !handlingVoice { try startHandlingVoice() }
-
-        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: audioEngine.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
-            self?.processAudioBufferFromUser(buffer: buffer)
+        audioEngineTwo.inputNode.installTap(onBus: 0, bufferSize: 4096, format: audioEngineTwo.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.processAudioBufferTwo(buffer: buffer)
         }
-        isListening = true
+        isListeningTwo = true
     }
 
-    @MainActor func stopListening() {
-        guard isListening else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        isListening = false
+    /// Stop listening for the first instance
+    @MainActor public func stopListeningOne() {
+        guard isListeningOne else { return }
+        audioEngineOne.inputNode.removeTap(onBus: 0)
+        isListeningOne = false
     }
 
-    @MainActor func startHandlingVoice() throws {
-        guard !handlingVoice else { return }
+    /// Stop listening for the second instance
+    @MainActor public func stopListeningOther() {
+        guard isListeningTwo else { return }
+        audioEngineTwo.inputNode.removeTap(onBus: 0)
+        isListeningTwo = false
+    }
 
-        guard let converter = AVAudioConverter(from: audioEngine.inputNode.outputFormat(forBus: 0), to: desiredFormat) else {
-            throw ConversationError.converterInitializationFailed
-        }
-        userConverter.set(converter)
-
-        #if os(iOS)
+    /// Handle voice input for the first instance
+    @MainActor private func startHandlingVoiceOne() throws {
+        guard !handlingVoiceOne else { return }
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        #endif
 
-        audioEngine.attach(playerNode)
-        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: converter.inputFormat)
-
-        audioEngine.prepare()
-        try audioEngine.start()
-        handlingVoice = true
+        audioEngineOne.prepare()
+        try audioEngineOne.start()
+        handlingVoiceOne = true
     }
 
-    @MainActor func stopHandlingVoice() {
-        guard handlingVoice else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
-        audioEngine.disconnectNodeInput(playerNode)
-        audioEngine.disconnectNodeOutput(playerNode)
-        #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false)
-        #endif
-        isListening = false
-        handlingVoice = false
+    /// Handle voice input for the second instance
+    @MainActor private func startHandlingVoiceTwo() throws {
+        guard !handlingVoiceTwo else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+
+        audioEngineTwo.prepare()
+        try audioEngineTwo.start()
+        handlingVoiceTwo = true
+    }
+
+    /// Stop handling voice input for the first instance
+    @MainActor public func stopHandlingVoiceOne() {
+        guard handlingVoiceOne else { return }
+        audioEngineOne.stop()
+        handlingVoiceOne = false
+    }
+
+    /// Stop handling voice input for the second instance
+    @MainActor public func stopHandlingVoiceTwo() {
+        guard handlingVoiceTwo else { return }
+        audioEngineTwo.stop()
+        handlingVoiceTwo = false
+    }
+
+    // MARK: - Audio Processing
+
+    /// Process audio buffer for the first instance
+    private func processAudioBufferOne(buffer: AVAudioPCMBuffer) {
+        let audioData = buffer.toData(format: desiredFormat)
+        Task { try await clientOne.send(audioDelta: audioData) }
+    }
+
+    /// Process audio buffer for the second instance
+    private func processAudioBufferTwo(buffer: AVAudioPCMBuffer) {
+        let audioData = buffer.toData(format: desiredFormat)
+        Task { try await clientTwo.send(audioDelta: audioData) }
     }
 }
 
-private extension Conversation {
-    @MainActor func handleEvent(_ event: ServerEvent) {
-        switch event {
-        case let .error(event): errorStream.yield(event.error)
-        case let .sessionCreated(event): connected = true; session = event.session
-        case let .sessionUpdated(event): session = event.session
-        case let .conversationCreated(event): id = event.conversation.id
-        case let .conversationItemCreated(event): entries.append(event.item)
-        case let .conversationItemDeleted(event): entries.removeAll { $0.id == event.itemId }
-        default: break
-        }
-    }
+// MARK: - Utility Extensions
 
-    @MainActor func _keepIsPlayingPropertyUpdated() {
-        withObservationTracking { _ = queuedSamples.isEmpty } onChange: {
-            Task { @MainActor in self.isPlaying = self.queuedSamples.isEmpty }
-            self._keepIsPlayingPropertyUpdated()
-        }
+private extension AVAudioPCMBuffer {
+    func toData(format: AVAudioFormat) -> Data {
+        let ratio = format.sampleRate / self.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(frameLength) * ratio)
+        guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return Data() }
+        let audioData = convertedBuffer.audioBufferList.pointee.mBuffers.mData
+        let dataSize = Int(convertedBuffer.audioBufferList.pointee.mBuffers.mDataByteSize)
+        return Data(bytes: audioData, count: dataSize)
     }
 }
