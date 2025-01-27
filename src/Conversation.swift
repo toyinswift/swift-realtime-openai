@@ -14,38 +14,30 @@ public final class Conversation: Sendable {
 
     private let audioEngine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
-    private let sharedFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
-    private let inputProcessingQueue = DispatchQueue(label: "Conversation.AudioProcessing")
+    private let queuedSamples = UnsafeMutableArray<String>()
+    private let apiConverter = UnsafeInteriorMutable<AVAudioConverter>()
+    private let userConverter = UnsafeInteriorMutable<AVAudioConverter>()
+    private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
 
-    private let userAudioConverter = UnsafeInteriorMutable<AVAudioConverter>()
-    private let apiAudioConverter = UnsafeInteriorMutable<AVAudioConverter>()
-
-    /// A stream of errors that occur during the conversation.
     public let errors: AsyncStream<ServerError>
 
-    /// The unique ID of the conversation.
     @MainActor public private(set) var id: String?
-
-    /// The current session for this conversation.
     @MainActor public private(set) var session: Session?
-
-    /// A list of items in the conversation.
     @MainActor public private(set) var entries: [Item] = []
-
-    /// Whether the conversation is currently connected to the server.
     @MainActor public private(set) var connected: Bool = false
-
-    /// Whether the conversation is currently listening to the user's microphone.
     @MainActor public private(set) var isListening: Bool = false
-
-    /// Whether this conversation is currently handling voice input and output.
     @MainActor public private(set) var handlingVoice: Bool = false
-
-    /// Whether the user is currently speaking.
     @MainActor public private(set) var isUserSpeaking: Bool = false
-
-    /// Whether the model is currently speaking.
     @MainActor public private(set) var isPlaying: Bool = false
+
+    @MainActor public var messages: [Item.Message] {
+        entries.compactMap {
+            if case let .message(message) = $0 {
+                return message
+            }
+            return nil
+        }
+    }
 
     private init(client: RealtimeAPI) {
         self.client = client
@@ -56,16 +48,16 @@ public final class Conversation: Sendable {
             for try await event in client.events {
                 await self.handleEvent(event)
             }
-            await MainActor.run {
-                self.connected = false
-            }
+            await MainActor.run { self.connected = false }
         }
 
         Task { @MainActor in
             self.cancelTask = task.cancel
             client.onDisconnect = { [weak self] in
-                Task { @MainActor in self?.connected = false }
+                guard let self else { return }
+                Task { @MainActor in self.connected = false }
             }
+            self._keepIsPlayingPropertyUpdated()
         }
     }
 
@@ -77,84 +69,129 @@ public final class Conversation: Sendable {
         }
     }
 
-    /// Create a new conversation providing an API token and optionally a model.
     public convenience init(authToken token: String, model: String = "gpt-4o-realtime-preview") {
         self.init(client: RealtimeAPI.webSocket(authToken: token, model: model))
     }
 
-    /// Start listening to the microphone and distribute audio to multiple processors.
-    @MainActor public func startListening() throws {
-        guard !isListening else { return }
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
-
-        // Install a single tap on the microphone input node
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.processMicrophoneInput(buffer)
-        }
-
-        try audioEngine.start()
-        isListening = true
-        print("Microphone listening started.")
+    public convenience init(connectingTo request: URLRequest) {
+        self.init(client: RealtimeAPI.webSocket(connectingTo: request))
     }
 
-    /// Stop listening to the microphone.
-    @MainActor public func stopListening() {
-        guard isListening else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
-        isListening = false
-        print("Microphone listening stopped.")
-    }
-
-    /// Process microphone input and distribute it to multiple handlers.
-    private func processMicrophoneInput(_ buffer: AVAudioPCMBuffer) {
-        inputProcessingQueue.async { [weak self] in
-            guard let self else { return }
-            // Process for user handling
-            self.processUserAudio(buffer)
-
-            // Process for server handling
-            self.processServerAudio(buffer)
+    @MainActor public func waitForConnection() async {
+        while !connected {
+            try? await Task.sleep(for: .milliseconds(500))
         }
     }
 
-    /// Handle audio intended for user-specific processing.
-    private func processUserAudio(_ buffer: AVAudioPCMBuffer) {
-        print("Processing audio for user...")
-        // Add your user-specific processing logic here
+    @MainActor public func whenConnected<E>(_ callback: @Sendable () async throws(E) -> Void) async throws(E) {
+        await waitForConnection()
+        try await callback()
     }
 
-    /// Handle audio intended for server-specific processing.
-    private func processServerAudio(_ buffer: AVAudioPCMBuffer) {
-        print("Processing audio for server...")
-        // Add your server-specific processing logic here
+    public func updateSession(withChanges callback: (inout Session) -> Void) async throws {
+        guard var session = await session else {
+            throw ConversationError.sessionNotFound
+        }
+        callback(&session)
+        try await setSession(session)
     }
 
-    /// Stop playing audio and reset the audio engine.
-    @MainActor public func stopHandlingVoice() {
-        guard handlingVoice else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
-        isListening = false
-        handlingVoice = false
-        print("Voice handling stopped.")
+    public func setSession(_ session: Session) async throws {
+        var session = session
+        session.id = nil
+        try await client.send(event: .updateSession(session))
+    }
+
+    public func send(event: ClientEvent) async throws {
+        try await client.send(event: event)
+    }
+
+    public func send(audioDelta audio: Data, commit: Bool = false) async throws {
+        try await send(event: .appendInputAudioBuffer(encoding: audio))
+        if commit { try await send(event: .commitInputAudioBuffer()) }
+    }
+
+    public func send(from role: Item.ItemRole, text: String, response: Response.Config? = nil) async throws {
+        if await handlingVoice { await interruptSpeech() }
+        try await send(event: .createConversationItem(Item(message: Item.Message(id: String(randomLength: 32), from: role, content: [.input_text(text)]))))
+        try await send(event: .createResponse(response))
+    }
+
+    public func send(result output: Item.FunctionCallOutput) async throws {
+        try await send(event: .createConversationItem(Item(with: output)))
     }
 }
 
-/// Extension for event handling
+public extension Conversation {
+    @MainActor func startListening() throws {
+        guard !isListening else { return }
+        if !handlingVoice { try startHandlingVoice() }
+
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: audioEngine.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.processAudioBufferFromUser(buffer: buffer)
+        }
+        isListening = true
+    }
+
+    @MainActor func stopListening() {
+        guard isListening else { return }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        isListening = false
+    }
+
+    @MainActor func startHandlingVoice() throws {
+        guard !handlingVoice else { return }
+
+        guard let converter = AVAudioConverter(from: audioEngine.inputNode.outputFormat(forBus: 0), to: desiredFormat) else {
+            throw ConversationError.converterInitializationFailed
+        }
+        userConverter.set(converter)
+
+        #if os(iOS)
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        #endif
+
+        audioEngine.attach(playerNode)
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: converter.inputFormat)
+
+        audioEngine.prepare()
+        try audioEngine.start()
+        handlingVoice = true
+    }
+
+    @MainActor func stopHandlingVoice() {
+        guard handlingVoice else { return }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        audioEngine.disconnectNodeInput(playerNode)
+        audioEngine.disconnectNodeOutput(playerNode)
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setActive(false)
+        #endif
+        isListening = false
+        handlingVoice = false
+    }
+}
+
 private extension Conversation {
     @MainActor func handleEvent(_ event: ServerEvent) {
         switch event {
-        case let .error(event):
-            errorStream.yield(event.error)
-        case let .sessionCreated(event):
-            connected = true
-            session = event.session
-        case let .conversationCreated(event):
-            id = event.conversation.id
-        default:
-            break
+        case let .error(event): errorStream.yield(event.error)
+        case let .sessionCreated(event): connected = true; session = event.session
+        case let .sessionUpdated(event): session = event.session
+        case let .conversationCreated(event): id = event.conversation.id
+        case let .conversationItemCreated(event): entries.append(event.item)
+        case let .conversationItemDeleted(event): entries.removeAll { $0.id == event.itemId }
+        default: break
+        }
+    }
+
+    @MainActor func _keepIsPlayingPropertyUpdated() {
+        withObservationTracking { _ = queuedSamples.isEmpty } onChange: {
+            Task { @MainActor in self.isPlaying = self.queuedSamples.isEmpty }
+            self._keepIsPlayingPropertyUpdated()
         }
     }
 }
