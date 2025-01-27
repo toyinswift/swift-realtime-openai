@@ -4,7 +4,7 @@ import Foundation
 public enum ConversationError: Error {
     case sessionNotFound
     case converterInitializationFailed
-}
+} 
 
 @Observable
 public final class Conversation: Sendable {
