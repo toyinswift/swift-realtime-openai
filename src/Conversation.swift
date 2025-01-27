@@ -213,7 +213,7 @@ public extension Conversation {
 
 		#if os(iOS)
 		let audioSession = AVAudioSession.sharedInstance()
-		try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+		try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
 		try audioSession.setActive(true)
 		#endif
 
